@@ -18,8 +18,27 @@ def recognize(models: dict, test_set: SinglesData):
            ['WORDGUESS0', 'WORDGUESS1', 'WORDGUESS2',...]
    """
     warnings.filterwarnings("ignore", category=DeprecationWarning)
+
     probabilities = []
+    for word_id, (X, lengths) in test_set.get_all_Xlengths().items():
+        prob = {}
+        for word, model in models.items():
+            if model is None:
+                continue
+
+            try:
+                score = model.score(X, lengths)
+                prob[word] = score
+            except ValueError:
+                # The models of these words always raise an ValueError
+                #   ANN, CANDY, FIND, LEG, OLD, SAY-1P
+                continue
+        probabilities.append(prob)
+
     guesses = []
-    # TODO implement the recognizer
-    # return probabilities, guesses
-    raise NotImplementedError
+    for prob in probabilities:
+        assert len(prob) > 0
+        _, guess = max([(v, k) for k, v in prob.items()])
+        guesses.append(guess)
+
+    return probabilities, guesses

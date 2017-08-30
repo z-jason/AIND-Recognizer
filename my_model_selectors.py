@@ -6,6 +6,7 @@ import numpy as np
 from hmmlearn.hmm import GaussianHMM
 from sklearn.model_selection import KFold
 from asl_utils import combine_sequences
+import asl_data
 
 
 class ModelSelector(object):
@@ -41,7 +42,7 @@ class ModelSelector(object):
             if self.verbose:
                 print("model created for {} with {} states".format(self.this_word, num_states))
             return hmm_model
-        except:
+        except Exception:
             if self.verbose:
                 print("failure on {} with {} states".format(self.this_word, num_states))
             return None
@@ -76,8 +77,51 @@ class SelectorBIC(ModelSelector):
         """
         warnings.filterwarnings("ignore", category=DeprecationWarning)
 
-        # TODO implement model selection based on BIC scores
-        raise NotImplementedError
+        models = []
+        for n in range(self.min_n_components, self.max_n_components+1):
+            model = self.base_model(n)
+
+            if model is None:
+                continue
+
+            try:
+                log_l = model.score(self.X, self.lengths)
+            except ValueError:
+                # NOTE: Only happen to 'FISH' when 6 <= n <= 15
+                #   This issue is reported in this post: http://bit.ly/2xfola5
+                continue
+
+            score = self._get_bic_score(log_l, n)
+            models.append((score, model))
+
+        if len(models) == 0:
+            return None
+
+        return sorted(models)[0][1]
+
+    # The smaller BIC score the better
+    def _get_bic_score(self, log_l, num_states):
+        """
+
+        Parameters
+        ----------
+        log_l
+        num_states
+
+        Returns
+        -------
+
+        References
+        ----------
+        bic = -2 * logL + p * logN
+        http://bit.ly/2xfQKgr
+        http://bit.ly/2xgwn2C
+        https://rdrr.io/cran/HMMpa/man/AIC_HMM.html
+        """
+        num_of_features = len(self.X[0])
+        parameter = num_states ** 2 + 2 * num_states * num_of_features - 1
+        log_n = math.log(len(self.X))
+        return -2 * log_l + parameter * log_n
 
 
 class SelectorDIC(ModelSelector):
@@ -92,8 +136,28 @@ class SelectorDIC(ModelSelector):
     def select(self):
         warnings.filterwarnings("ignore", category=DeprecationWarning)
 
-        # TODO implement model selection based on DIC scores
-        raise NotImplementedError
+        models = []
+        for n in range(self.min_n_components, self.max_n_components+1):
+            model = self.base_model(n)
+            if model is None:
+                continue
+            try:
+                log_l = model.score(self.X, self.lengths)
+                anti_log_ls = [model.score(x, lengths) for x, lengths in self._other_word_Xlengths()]
+            except ValueError:
+                continue
+            score = log_l - np.mean(anti_log_ls)
+            models.append((score, model))
+
+        if len(models) == 0:
+            return None
+
+        return sorted(models)[-1][1]
+
+    def _other_word_Xlengths(self):
+        for word, (X, lengths) in self.hwords.items():
+            if word != self.this_word:
+                yield X, lengths
 
 
 class SelectorCV(ModelSelector):
@@ -104,5 +168,44 @@ class SelectorCV(ModelSelector):
     def select(self):
         warnings.filterwarnings("ignore", category=DeprecationWarning)
 
-        # TODO implement model selection using CV
-        raise NotImplementedError
+        # If the given word has less than 3 sample, it does not make sense to do the K-fold CV
+        # Just return something the same as SelectorConstant
+        if len(self.sequences) < 3:
+            return self.base_model(self.n_constant)
+
+        best_num_states = self._get_best_num_states(self._score_func)
+
+        return self.base_model(best_num_states)
+
+    def _score_func(self, num_states):
+        model = GaussianHMM(n_components=num_states,
+                            covariance_type="diag", n_iter=1000,
+                            random_state=self.random_state, verbose=False)
+        logLs = []
+        split_method = KFold(n_splits=3)
+        for cv_train_idx, cv_test_idx in split_method.split(self.sequences):
+            # print("Train fold indices:{} Test fold indices:{}".format(cv_train_idx, cv_test_idx))
+            training_X, training_lengths = combine_sequences(cv_train_idx, self.sequences)
+            testing_X, testing_lengths = combine_sequences(cv_test_idx, self.sequences)
+            trained_model = model.fit(training_X, training_lengths)
+            try:
+                logL = trained_model.score(testing_X, testing_lengths)
+            # Saw this when training w/ word 'VEGETABLE' when num_states = 13
+            #   `ValueError: rows of transmat_must sum to 1.0 (got [ 1.  1.  1.  1.  1.  1.  0.  1.  1.  1.  1.  1.  1.])`
+            # NOTE: Potential this statement may cause `logLs` to be empty
+            except ValueError:
+                continue
+            logLs.append(logL)
+        try:
+            return sum(logLs) / len(logLs)
+        except ZeroDivisionError:
+            return float('-inf')
+
+    def _get_best_num_states(self, score_func):
+        scores = self._get_scores(score_func)
+        _, best_num_states = sorted(scores, reverse=True)[0]
+        return best_num_states
+
+    def _get_scores(self, score_func):
+        return [(score_func(n), n) for n in range(self.min_n_components, self.max_n_components+1)]
+
